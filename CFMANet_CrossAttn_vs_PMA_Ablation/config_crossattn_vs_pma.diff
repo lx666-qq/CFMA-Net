@@ -1,0 +1,12 @@
+--- /mnt/data/fold0_resnet50(1).yaml	2026-08-09 09:03:35.627264950 +0000
++++ /mnt/data/CFMANet_CrossAttn_vs_PMA_Ablation/config/fold0_resnet50.yaml	2026-08-09 09:05:39.384683046 +0000
+@@ -47,7 +47,8 @@
+   viz: False
+   vis_num: 260
+   eval_only: False
+-  pma_mode: concat
++  pma_mode: sinkhorn
++  cmad_match_mode: pma  # direct / cross_attention / pma; only changes CMAD internal interaction
+   pma_patch_size: 7
+   pma_epsilon: 0.05
+   pma_sinkhorn_iter: 2

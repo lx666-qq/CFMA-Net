@@ -1,0 +1,186 @@
+--- /mnt/data/mfanet(2).py	2026-08-09 09:03:35.635264951 +0000
++++ /mnt/data/CFMANet_CrossAttn_vs_PMA_Ablation/model/mfanet.py	2026-08-09 09:05:39.383317972 +0000
+@@ -500,6 +500,127 @@
+         }
+         return fused, vis_dict
+ 
++
++class DirectFusion(nn.Module):
++    """CMAD interaction baseline without explicit correspondence modeling.
++
++    Support/guidance information is still provided, so this is a stricter
++    baseline than simply returning the query feature.
++    """
++    def __init__(self, in_channels):
++        super().__init__()
++        self.fuse = GBM(in_channels * 2, in_channels)
++
++    def forward(self, base_feat, guidance_feat):
++        if guidance_feat.shape[-2:] != base_feat.shape[-2:]:
++            guidance_feat = F.interpolate(
++                guidance_feat,
++                size=base_feat.shape[-2:],
++                mode='bilinear',
++                align_corners=False
++            )
++        return self.fuse(torch.cat([base_feat, guidance_feat], dim=1))
++
++
++class PatchCrossAttention(nn.Module):
++    """Lightweight patch cross-attention used only for the CMAD replacement ablation.
++
++    Fairness constraints relative to PMA:
++      * the same input features are used;
++      * the same patch pooling window is used;
++      * Q/K width matches PMA's reduced matching width;
++      * no Transformer FFN/LayerNorm block is added;
++      * no extra V projection is used;
++      * the same 1x1-BN-Sigmoid confidence gate style is retained.
++
++    Query tokens come from ``base_feat`` and key/value tokens come from
++    ``guidance_feat``. The attention-weighted support feature is projected back
++    to the query spatial grid and fused through a confidence gate.
++    """
++    def __init__(self, in_channels, mid_channels=None, patch_size=7):
++        super().__init__()
++        mid_channels = mid_channels or in_channels // 4
++        self.in_channels = int(in_channels)
++        self.mid_channels = int(mid_channels)
++        self.patch_size = int(patch_size)
++
++        self.transform_q = nn.Sequential(
++            GBM(in_channels, mid_channels),
++            nn.BatchNorm2d(mid_channels)
++        )
++        self.transform_k = nn.Sequential(
++            GBM(in_channels, mid_channels),
++            nn.BatchNorm2d(mid_channels)
++        )
++        # Keep the fusion-gate capacity comparable with PMA.
++        self.adapter = nn.Sequential(
++            nn.Conv2d(1, in_channels, 1, bias=False),
++            nn.BatchNorm2d(in_channels),
++            nn.Sigmoid()
++        )
++
++    def forward(self, base_feat, guidance_feat):
++        b, c, h, w = base_feat.shape
++        if guidance_feat.shape[-2:] != (h, w):
++            guidance_feat = F.interpolate(
++                guidance_feat, size=(h, w), mode='bilinear', align_corners=False
++            )
++
++        # Standard cross-attention orientation:
++        # query <- base/query feature, key/value <- support-guidance feature.
++        q = self.transform_q(base_feat)
++        k = self.transform_k(guidance_feat)
++
++        ps = max(1, min(self.patch_size, h, w))
++        q_patch = F.avg_pool2d(q, kernel_size=ps, stride=ps)
++        k_patch = F.avg_pool2d(k, kernel_size=ps, stride=ps)
++        v_patch = F.avg_pool2d(guidance_feat, kernel_size=ps, stride=ps)
++
++        _, _, h_p, w_p = q_patch.shape
++        q_flat = q_patch.flatten(2).transpose(1, 2)         # [B, Nq, d]
++        k_flat = k_patch.flatten(2).transpose(1, 2)         # [B, Nk, d]
++        v_flat = v_patch.flatten(2).transpose(1, 2)         # [B, Nk, C]
++
++        scale = float(max(self.mid_channels, 1)) ** -0.5
++        logits = torch.bmm(q_flat, k_flat.transpose(1, 2)) * scale
++        attn = F.softmax(logits, dim=2)                     # [B, Nq, Nk]
++
++        attended = torch.bmm(attn, v_flat)                  # [B, Nq, C]
++        attended = attended.transpose(1, 2).contiguous().reshape(
++            b, c, h_p, w_p
++        )
++        attended_up = F.interpolate(
++            attended, size=(h, w), mode='bilinear', align_corners=False
++        )
++
++        # Query-side confidence from the strongest support correspondence.
++        confidence = attn.max(dim=2)[0].reshape(b, 1, h_p, w_p)
++        confidence_up = F.interpolate(
++            confidence, size=(h, w), mode='bilinear', align_corners=False
++        )
++        gate = self.adapter(confidence_up)
++
++        return (1.0 - gate) * base_feat + gate * attended_up
++
++
++def _build_cmad_matcher(mode, dim, pma_kwargs):
++    """Construct only the CMAD interaction module; pre-alignment PMA is separate."""
++    mode = str(mode).lower()
++    if mode == 'pma':
++        return PMA(dim, **pma_kwargs)
++    if mode == 'cross_attention':
++        return PatchCrossAttention(
++            dim,
++            mid_channels=dim // 4,
++            patch_size=int(pma_kwargs.get('patch_size', 7))
++        )
++    if mode == 'direct':
++        return DirectFusion(dim)
++    raise ValueError(
++        f'Unsupported cmad_match_mode={mode}. '
++        "Valid values are: direct, cross_attention, pma"
++    )
++
+ class SepAtrousConv(nn.Module):
+     def __init__(self, in_c, out_c, dilation):
+         super().__init__()
+@@ -518,16 +639,24 @@
+ class CMAD(nn.Module):
+     """Cross-granularity matching and alignment decoder.
+ 
+-    All PMA instances receive the same ablation configuration. This is
+-    important: switching ``pma_mode`` replaces PMA consistently in the
+-    reference interaction and in both decoder matching stages.
++    ``match_mode`` changes ONLY the two interaction stages inside CMAD.
++    The pre-alignment ``CFMANet.pma_ref`` remains the original PMA, which makes
++    Cross-Attention-vs-PMA a clean decoder-level replacement ablation.
+     """
+-    def __init__(self, dim=256, drop_rate=0.3, pma_kwargs=None):
++    VALID_MATCH_MODES = ('direct', 'cross_attention', 'pma')
++
++    def __init__(self, dim=256, drop_rate=0.3, pma_kwargs=None, match_mode='pma'):
+         super().__init__()
+         pma_kwargs = dict(pma_kwargs or {})
++        self.match_mode = str(match_mode).lower()
++        if self.match_mode not in self.VALID_MATCH_MODES:
++            raise ValueError(
++                f'Unsupported CMAD match mode: {self.match_mode}. '
++                f'Valid modes: {self.VALID_MATCH_MODES}'
++            )
+ 
+         self.mca = MCA(dim)
+-        self.pma_fusion = PMA(dim, **pma_kwargs)
++        self.pma_fusion = _build_cmad_matcher(self.match_mode, dim, pma_kwargs)
+         self.dropout = nn.Dropout2d(drop_rate)
+         self.up1 = nn.Sequential(
+             GBM(dim, dim),
+@@ -538,7 +667,7 @@
+             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+         )
+         self.low_fusion = GBM(dim * 2, dim)
+-        self.pma_high = PMA(dim, **pma_kwargs)
++        self.pma_high = _build_cmad_matcher(self.match_mode, dim, pma_kwargs)
+         self.ms_conv = nn.ModuleList([
+             SepAtrousConv(dim, dim // 4, dilation=2 ** i)
+             for i in range(3)
+@@ -654,7 +783,15 @@
+             balanced_iter=self.pma_balanced_iter,
+             use_adapter=self.pma_use_adapter,
+         )
+-        self.cmad = CMAD(reduce_dim, pma_kwargs=pma_kwargs)
++        # IMPORTANT FOR THE CMAD ABLATION:
++        # pma_ref is intentionally NOT controlled by cmad_match_mode.
++        # It always follows pma_mode (use sinkhorn for the fair main comparison).
++        self.cmad_match_mode = str(getattr(args, 'cmad_match_mode', 'pma')).lower()
++        self.cmad = CMAD(
++            reduce_dim,
++            pma_kwargs=pma_kwargs,
++            match_mode=self.cmad_match_mode
++        )
+         self.pma_ref = PMA(reduce_dim, **pma_kwargs)
+ 
+         self.init_merge = nn.Sequential(GBM(reduce_dim * 3 + 1, reduce_dim), nn.BatchNorm2d(reduce_dim),

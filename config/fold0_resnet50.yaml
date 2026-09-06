@@ -1,0 +1,56 @@
+DATA:
+  data_root: './data/CGFSDS-9' #'./data/FSSD-12'/'./data/CGFSDS-9'
+  train_list: './data_list/defect_cdfssd/train/train_defect.txt' #'./data_list/defect_cdfssd/train/train_defect.txt'/'./data_list/defect_fssd/train/fold0_defect.txt'
+  val_list: './data_list/defect_cdfssd/val/val_defect.txt' #'./data_list/defect_cdfssd/val/val_defect.txt'/'./data_list/defect_fssd/val/fold0_defect.txt'
+  data_set: 'cgfds'      #fssd12/cgfds
+  classes: 2
+
+TRAIN:
+  layers: 50
+  sync_bn: False
+  train_h: 200
+  train_w: 200
+  val_size: 200
+  scale_min: 0.8 #0.9    # minimum random scale
+  scale_max: 1.2 #1.1    # maximum random scale
+  rotate_min: -12 #-10   # minimum random rotate
+  rotate_max: 12 #10    # maximum random rotate
+  zoom_factor: 8
+  ignore_label: 255
+  padding_label: 255
+  aux_weight: 1.0
+  train_gpu: [0]
+  workers: 4        # data loader workers 2->4
+  batch_size: 4    # batch size for training
+  batch_size_val: 1
+  base_lr: 0.0001 #0.0001
+  epochs: 100
+  start_epoch: 0
+  power: 0.9        # 0 means no decay
+  momentum: 0.9
+  weight_decay: 0.0001 #0.0001
+  manual_seed: 2025
+  print_freq: 30
+  save_freq: 1
+  save_path: './checkpoints' # model saved path
+  shot: 1
+  weight: 'Weight/cgfds/NETR/split0/resnet50/snapshot'
+  resume: 'train_epoch_53_0.7637713893147264.pth'
+  evaluate: True
+  split: 0
+  vgg: False # use vgg as backbone or not
+  ppm_scales: [60, 30, 15, 8]
+  fix_random_seed_val: True
+  warmup: False #False
+  resized_val: True
+  ori_resize: True  # use original label for evaluation
+  viz: True
+  vis_num: 263
+  eval_only: False
+  pma_mode: sinkhorn
+  cmad_match_mode: pma  # direct / cross_attention / pma; only changes CMAD internal interaction
+  pma_patch_size: 7
+  pma_epsilon: 0.05
+  pma_sinkhorn_iter: 1
+  pma_no_adapter: false
+  pma_analysis: True
